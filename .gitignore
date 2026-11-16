@@ -1,0 +1,16 @@
+# Build products, caches, and bundled runtime
+/build/
+
+# Local app data and model weights
+*.onnx
+*.safetensors
+*.pdparams
+*.pdmodel
+*.pdiparams
+/official_models/
+
+# macOS metadata
+.DS_Store
+
+# Never publish synced project reference materials
+/sources/
