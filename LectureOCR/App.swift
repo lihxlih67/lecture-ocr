@@ -40,7 +40,7 @@ enum OCRMode: String, CaseIterable, Identifiable {
 final class OCRModel: ObservableObject {
     @Published var queue: [QueueItem] = [] { didSet { persistSession() } }
     @Published var selectedID: UUID? { didSet { hoveredBlockID = nil; persistSession() } }
-    @Published var progress = 0.0
+    @Published var progress: Double?
     @Published var status = "Добавьте фотографии лекций или PDF"
     @Published var isRunning = false
     @Published var isMovingArchive = false
@@ -276,9 +276,9 @@ final class OCRModel: ObservableObject {
     func recognize() {
         guard !queue.isEmpty, !isRunning else { return }
         isRunning = true
-        progress = 0
         errorMessage = nil
-        status = "Проверка локальных моделей…"
+        status = "Подготавливаю модели и распознаю страницы…"
+        progress = nil
         Task { await runOCR() }
     }
 
@@ -322,24 +322,16 @@ final class OCRModel: ObservableObject {
                 throw NSError(domain: "LectureOCR", code: 3, userInfo: [NSLocalizedDescriptionKey: "Не найден встроенный Python. Соберите приложение через build-app.sh."])
             }
             let modelRoot = modelDirectory
-            var required = ["PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc"]
-            switch mode {
-            case .vl: required += ["PaddleOCR-VL-1.6"]
-            case .structure: required += ["PP-OCRv5_mobile_det", "eslav_PP-OCRv5_mobile_rec"]
-            case .hybrid: required += ["PP-OCRv5_mobile_det", "eslav_PP-OCRv5_mobile_rec", "PP-OCRv6_medium_rec_cyrillic_onnx"]
-            }
-            let missing = required.filter { !FileManager.default.fileExists(atPath: modelRoot.appendingPathComponent($0).path) }
-            guard missing.isEmpty else {
-                throw NSError(domain: "LectureOCR", code: 4, userInfo: [NSLocalizedDescriptionKey:
-                    "Не все модели установлены: \(missing.joined(separator: ", ")). Скачайте недостающие модели и повторите."])
-            }
             try FileManager.default.createDirectory(at: modelRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
             let process = Process()
             process.executableURL = python
             process.arguments = [worker.path]
             let sitePackages = Bundle.main.resourceURL!.appendingPathComponent("python/site-packages").path
             var env = ProcessInfo.processInfo.environment
-            env["PADDLE_PDX_CACHE_HOME"] = modelRoot.deletingLastPathComponent().path
+            let paddlexCacheHome = modelRoot.lastPathComponent == "official_models"
+                ? modelRoot.deletingLastPathComponent()
+                : modelRoot
+            env["PADDLE_PDX_CACHE_HOME"] = paddlexCacheHome.path
             env["LECTURE_OCR_MODEL_DIR"] = modelRoot.path
             env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
             env["PYTHONUNBUFFERED"] = "1"
@@ -386,6 +378,14 @@ final class OCRModel: ObservableObject {
         switch object["event"] as? String {
         case "status":
             status = object["message"] as? String ?? status
+            if object["stage"] as? String == "models" { progress = nil }
+            if object["stage"] as? String == "recognition" { progress = 0 }
+        case "model_download":
+            let downloaded = object["downloaded"] as? Double ?? 0
+            let total = max(1, object["total"] as? Double ?? 1)
+            progress = min(1, downloaded / total)
+            let percent = Int((downloaded / total * 100).rounded())
+            status = "Скачиваю модель · \(object["file"] as? String ?? "файл") · \(percent)%"
         case "page":
             guard let idString = object["id"] as? String, let id = UUID(uuidString: idString) else { return }
             let rawBlocks = object["blocks"] as? [[String: Any]] ?? []
@@ -819,8 +819,14 @@ struct ContentView: View {
                 }.listStyle(.inset)
             }
             Text(model.status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-            if model.isRunning || model.progress > 0 {
-                ProgressView(value: model.progress).accessibilityLabel("Прогресс распознавания")
+            if model.isRunning {
+                if let progress = model.progress {
+                    ProgressView(value: progress).accessibilityLabel("Прогресс подготовки модели или распознавания")
+                } else {
+                    ProgressView().accessibilityLabel("Подготовка моделей")
+                }
+            } else if let progress = model.progress, progress > 0 {
+                ProgressView(value: progress).accessibilityLabel("Прогресс распознавания")
                     .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .bottom)))
             }
         }.padding(14).frame(width: 255)
@@ -984,12 +990,12 @@ struct SettingsView: View {
                     HStack {
                         Button("Папка с моделями…") { chooseModelFolder() }
                         Spacer()
-                        Text("\(availableModelFolders) из 8 знакомых папок")
-                            .font(.caption).foregroundStyle(availableModelFolders > 0 ? Color.secondary : Color.orange)
+                        Text("Найдено папок: \(availableModelFolders) из 8")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     Text(model.modelDirectory.path).font(.caption.monospaced()).foregroundStyle(.secondary)
                         .lineLimit(2).textSelection(.enabled).truncationMode(.middle)
-                    Text("Выбери папку с подпапками моделей на Mac или внешнем диске. При выборе папки PaddleX/official_models она распознаётся автоматически.")
+                    Text("При первом нажатии «Распознать» недостающие модели выбранного режима скачаются автоматически и останутся на Mac. Нужен интернет. Можно выбрать другую папку или указать official_models с уже установленными весами.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Распознавание") {

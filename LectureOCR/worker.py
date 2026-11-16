@@ -1,11 +1,13 @@
-"""Local OCR worker. Model weights must already be present in PaddleX's cache."""
+"""Local OCR worker. Missing OCR models are downloaded on first use."""
 
 import json
 import os
 import re
 import sys
 import tempfile
+import urllib.error
 import traceback
+import urllib.request
 from pathlib import Path
 
 
@@ -13,25 +15,85 @@ def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
-def cache_dir():
+def cache_dirs():
     selected = os.environ.get("LECTURE_OCR_MODEL_DIR")
-    if selected:
-        return Path(selected)
     raw = os.environ.get("PADDLE_PDX_CACHE_HOME")
     if not raw:
         raise RuntimeError("Не задан каталог моделей PaddleX.")
-    root = Path(raw)
-    return root / "official_models"
+    paddle_models = Path(raw) / "official_models"
+    candidates = [Path(selected)] if selected else []
+    if paddle_models not in candidates:
+        candidates.append(paddle_models)
+    return candidates
 
 
-def require_model(name, required):
-    folder = cache_dir() / name
-    missing = [entry for entry in required if not (folder / entry).is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"Не найдена модель «{name}» или её файлы ({', '.join(missing)}). "
-            "Проверьте папку Library/Application Support/Lecture OCR/PaddleX/official_models."
+def cache_dir():
+    raw = os.environ.get("PADDLE_PDX_CACHE_HOME")
+    if not raw:
+        raise RuntimeError("Не задан каталог моделей PaddleX.")
+    return Path(raw) / "official_models"
+
+
+def local_model(name, required):
+    for root in cache_dirs():
+        folder = root / name
+        if all((folder / entry).is_file() for entry in required):
+            return folder
+    return None
+
+
+CYRILLIC_MODEL_REVISION = "4f35024ef590b24c12101abfa5184c7fbb5f7299"
+CYRILLIC_MODEL_FILES = (
+    "inference.yml",
+    "inference.onnx",
+)
+
+
+def ensure_cyrillic_model():
+    folder = cache_dir() / "PP-OCRv6_medium_rec_cyrillic_onnx"
+    existing = local_model("PP-OCRv6_medium_rec_cyrillic_onnx", CYRILLIC_MODEL_FILES)
+    if existing and (existing / "inference.onnx").stat().st_size >= 50_000_000:
+        return existing
+
+    folder.mkdir(parents=True, exist_ok=True)
+    base_url = (
+        "https://huggingface.co/metrika-labs/PP-OCRv6_medium_rec_cyrillic_onnx"
+        f"/resolve/{CYRILLIC_MODEL_REVISION}"
+    )
+    for filename in CYRILLIC_MODEL_FILES:
+        destination = folder / filename
+        if destination.is_file() and destination.stat().st_size > 0:
+            if filename != "inference.onnx" or destination.stat().st_size >= 50_000_000:
+                continue
+        emit({"event": "status", "stage": "models", "message": f"Скачиваю кириллическую модель · {filename}"})
+        request = urllib.request.Request(
+            f"{base_url}/{filename}",
+            headers={"User-Agent": "LectureOCR/1.3"},
         )
+        temporary = folder / f".{filename}.download"
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+                expected = int(response.headers.get("Content-Length", "0"))
+                downloaded = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if expected:
+                        emit({"event": "model_download", "file": filename,
+                              "downloaded": downloaded, "total": expected})
+                output.flush()
+                os.fsync(output.fileno())
+            if expected and downloaded != expected:
+                raise IOError(f"Файл {filename} загружен не полностью.")
+            if filename == "inference.onnx" and downloaded < 50_000_000:
+                raise IOError("Скачанный файл ONNX слишком мал и, вероятно, повреждён.")
+            os.replace(temporary, destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
     return folder
 
 
@@ -369,43 +431,61 @@ def enhance_image(source, destination):
 
 
 def make_pipeline(mode):
-    layout = require_model("PP-DocLayoutV3", ["inference.yml", "inference.pdiparams"])
-    orientation = require_model("PP-LCNet_x1_0_doc_ori", ["inference.yml", "inference.pdiparams"])
-    unwarp = require_model("UVDoc", ["inference.yml", "inference.pdiparams"])
+    local_models = {
+        "layout": local_model("PP-DocLayoutV3", ["inference.yml", "inference.pdiparams"]),
+        "orientation": local_model("PP-LCNet_x1_0_doc_ori", ["inference.yml", "inference.pdiparams"]),
+        "unwarp": local_model("UVDoc", ["inference.yml", "inference.pdiparams"]),
+    }
     if mode == "vl":
         from paddleocr import PaddleOCRVL
-        vl = require_model("PaddleOCR-VL-1.6", ["config.json", "model.safetensors", "tokenizer.json"])
-        pipeline = PaddleOCRVL(
+        vl = local_model("PaddleOCR-VL-1.6", ["config.json", "model.safetensors", "tokenizer.json"])
+        options = dict(
             pipeline_version="v1.6", layout_detection_model_name="PP-DocLayoutV3",
-            layout_detection_model_dir=str(layout), vl_rec_model_name="PaddleOCR-VL-1.6-0.9B",
-            vl_rec_model_dir=str(vl), doc_orientation_classify_model_name="PP-LCNet_x1_0_doc_ori",
-            doc_orientation_classify_model_dir=str(orientation), doc_unwarping_model_name="UVDoc",
-            doc_unwarping_model_dir=str(unwarp), use_doc_orientation_classify=True,
+            vl_rec_model_name="PaddleOCR-VL-1.6-0.9B",
+            doc_orientation_classify_model_name="PP-LCNet_x1_0_doc_ori",
+            doc_unwarping_model_name="UVDoc", use_doc_orientation_classify=True,
             use_doc_unwarping=True, device="cpu",
         )
+        if local_models["layout"]:
+            options["layout_detection_model_dir"] = str(local_models["layout"])
+        if vl:
+            options["vl_rec_model_dir"] = str(vl)
+        if local_models["orientation"]:
+            options["doc_orientation_classify_model_dir"] = str(local_models["orientation"])
+        if local_models["unwarp"]:
+            options["doc_unwarping_model_dir"] = str(local_models["unwarp"])
+        pipeline = PaddleOCRVL(**options)
         return pipeline, None
-    det = require_model("PP-OCRv5_mobile_det", ["inference.yml", "inference.pdiparams"])
-    printed = require_model("eslav_PP-OCRv5_mobile_rec", ["inference.yml", "inference.pdiparams"])
+    det = local_model("PP-OCRv5_mobile_det", ["inference.yml", "inference.pdiparams"])
+    printed = local_model("eslav_PP-OCRv5_mobile_rec", ["inference.yml", "inference.pdiparams"])
     from paddleocr import PPStructureV3
-    htr = None
-    if mode == "hybrid":
-        hand = require_model("PP-OCRv6_medium_rec_cyrillic_onnx", ["inference.yml", "inference.onnx"])
-        from paddleocr import TextRecognition
-        htr = TextRecognition(model_name="PP-OCRv6_medium_rec", model_dir=str(hand),
-                              engine="onnxruntime", device="cpu")
-    pipeline = PPStructureV3(
-        layout_detection_model_name="PP-DocLayoutV3", layout_detection_model_dir=str(layout),
-        text_detection_model_name="PP-OCRv5_mobile_det", text_detection_model_dir=str(det),
-        text_recognition_model_name="eslav_PP-OCRv5_mobile_rec", text_recognition_model_dir=str(printed),
+    options = dict(
+        layout_detection_model_name="PP-DocLayoutV3",
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name="eslav_PP-OCRv5_mobile_rec",
         doc_orientation_classify_model_name="PP-LCNet_x1_0_doc_ori",
-        doc_orientation_classify_model_dir=str(orientation),
-        doc_unwarping_model_name="UVDoc", doc_unwarping_model_dir=str(unwarp),
+        doc_unwarping_model_name="UVDoc",
         use_doc_orientation_classify=True, use_doc_unwarping=True,
         use_table_recognition=False, use_formula_recognition=False,
         use_chart_recognition=False, use_seal_recognition=False,
         use_region_detection=False,
         use_textline_orientation=False, format_block_content=True, device="cpu",
     )
+    optional_dirs = {
+        "layout_detection_model_dir": local_models["layout"],
+        "text_detection_model_dir": det,
+        "text_recognition_model_dir": printed,
+        "doc_orientation_classify_model_dir": local_models["orientation"],
+        "doc_unwarping_model_dir": local_models["unwarp"],
+    }
+    options.update({key: str(value) for key, value in optional_dirs.items() if value})
+    pipeline = PPStructureV3(**options)
+    htr = None
+    if mode == "hybrid":
+        hand = ensure_cyrillic_model()
+        from paddleocr import TextRecognition
+        htr = TextRecognition(model_name="PP-OCRv6_medium_rec", model_dir=str(hand),
+                              engine="onnxruntime", device="cpu")
     return pipeline, htr
 
 
@@ -420,9 +500,9 @@ def main():
         emit({"event": "error", "message": "Неизвестный режим форматирования."})
         return 2
     try:
-        emit({"event": "status", "message": "Проверяю локальные модели…"})
+        emit({"event": "status", "stage": "models", "message": "Проверяю модели и загружаю недостающие…"})
         pipeline, handwritten_recognizer = make_pipeline(mode)
-        emit({"event": "status", "message": "Модели готовы · распознавание страниц…"})
+        emit({"event": "status", "stage": "recognition", "message": "Модели готовы · распознаю страницы…"})
         with tempfile.TemporaryDirectory(prefix="lectureocr-enhanced-") as enhanced_dir:
             for index, item in enumerate(items, 1):
                 path = item["path"]
@@ -467,7 +547,10 @@ def main():
                     return 1
         return 0
     except Exception as exc:
-        emit({"event": "error", "message": f"Не удалось запустить распознавание: {exc}"})
+        message = f"Не удалось подготовить модели или запустить распознавание: {exc}"
+        if isinstance(exc, (OSError, urllib.error.URLError)):
+            message += "\nПроверьте подключение к интернету и повторите попытку. Уже загруженные модели сохраняются."
+        emit({"event": "error", "message": message})
         traceback.print_exc(file=sys.stderr)
         return 1
 
